@@ -21,3 +21,123 @@ jobs:
     steps:
       - name: approval confirmation
         run: echo "approval give to deploy into production"
+  linting:
+    name: Build and analyze
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+      - uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        
+  database:
+    needs: approval
+    runs-on: self-hosted
+    steps:
+      - name: create docker network
+        run: |
+          if docker network ls --format '{{ .Name }}' | grep -wq lmsnetwork; then
+            echo "lmsnetwork exist"
+          else
+            docker network create lmsnetwork
+          fi
+      - name: create chatdb container
+        run: |
+          if docker ps -a --format '{{ .Names }}' | grep -wq chatdb; then
+            echo "chatdb container exists"
+          else
+            docker container run -dt --name chatdb -p 5432:5432 --network lmsnetwork -e POSTGRES_PASSWORD=${{ secrets.DB_PASSWORD}} postgres
+          fi
+  build:
+    needs: 
+      - approval
+      - linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout the code
+        uses: actions/checkout@v4.2.2
+      - name: build backend image
+        run: |
+          cd api
+          docker build -t ${{ vars.DOCKER_USERNAME}}/api:latest .
+      - name: build frontend image
+        run: |
+          cd webapp
+          docker build -t ${{ vars.DOCKER_USERNAME}}/web:latest .
+      - name: Docker Hub Login
+        uses: docker/login-action@v3.4.0
+        with:
+          username: ${{ vars.DOCKER_USERNAME}}
+          password: ${{ secrets.DOCKER_PASSWORD}}
+      - name: push backend image
+        run: docker push ${{ vars.DOCKER_USERNAME}}/api:latest
+      - name: push frontend image
+        run: docker push ${{ vars.DOCKER_USERNAME}}/web:latest
+
+  backend:
+    needs: 
+      - database
+      - build
+    runs-on: deploy
+    steps:
+      - name: pull the image
+        run: docker pull ${{ vars.DOCKER_USERNAME}}/api:latest
+      - name: Run the backend
+        run: |
+          if docker ps -a --format '{{ .Names }}' | grep -wq backend; then
+            echo "backend container exists"
+            docker container rm -f backend
+            docker rmi ${{ vars.DOCKER_USERNAME}}/api:latest
+            docker container run -dt --name backend -p 3000:3000 --network lmsnetwork -e DATABASE_URL=postgresql://postgres:${{ secrets.DB_PASSWORD}}@lmsdb:5432/postgres -e PORT=3000 -e MODE=Prod  ${{ vars.DOCKER_USERNAME}}/api:latest
+          else
+            docker container run -dt --name backend -p 3000:3000 --network lmsnetwork -e DATABASE_URL=postgresql://postgres:${{ secrets.DB_PASSWORD}}@lmsdb:5432/postgres -e PORT=3000 -e MODE=Prod  ${{ vars.DOCKER_USERNAME}}/api:latest
+          fi
+  frontend:
+    needs: 
+      - build
+    runs-on: deploy
+    steps:
+      - name: pull the image
+        run: docker pull ${{ vars.DOCKER_USERNAME}}/web:latest
+      - name: Run the frontend
+        run: |
+          if docker ps -a --format '{{ .Names }}' | grep -wq frontend; then
+            echo "frontend container exists"
+            docker container rm -f frontend
+            docker rmi ${{ vars.DOCKER_USERNAME}}/web:latest
+            docker container run -dt --name frontend -p 80:80 --network lmsnetwork ${{ vars.DOCKER_USERNAME}}/web:latest
+          else
+            docker container run -dt --name frontend -p 80:80 --network lmsnetwork ${{ vars.DOCKER_USERNAME}}/web:latest
+          fi
+
+  feedback:
+    needs:
+      - database
+      - backend
+      - frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: send notification
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            channel: project-7
+            text: "LMS Application Successfully Deployed into Production..."
+
+
+
+
+
+
+
+
+
+
+        
+        
